@@ -37,6 +37,10 @@ pub fn subnet_predicate<P: Preset>(
                     false
                 }
             }
+            Subnet::ExecutionProof => {
+                // Check if ENR advertises zkVM support
+                enr.zkvm_enabled()
+            }
         });
 
         if !predicate {

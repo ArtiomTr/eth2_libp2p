@@ -18,6 +18,7 @@ discv5 = { workspace = true }
 eip_7594 = { workspace = true }
 either = { workspace = true }
 enum-iterator = { workspace = true }
+execution_proofs = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
 gossipsub = { workspace = true }

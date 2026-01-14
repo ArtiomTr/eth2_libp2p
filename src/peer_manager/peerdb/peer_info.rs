@@ -90,6 +90,15 @@ impl PeerInfo {
     /// Returns if the peer is subscribed to a given `Subnet` from the metadata attnets/syncnets field.
     /// Also returns true if the peer is assigned to custody a given data column `Subnet` computed from the metadata `custody_group_count` field or ENR `cgc` field.
     pub fn on_subnet_metadata(&self, subnet: &Subnet) -> bool {
+        // ExecutionProof capability is advertised via ENR zkvm flag, not metadata.
+        // Check this separately since it doesn't depend on metadata presence.
+        if let Subnet::ExecutionProof = subnet {
+            if let Some(enr) = self.enr.as_ref() {
+                return enr.zkvm_enabled();
+            }
+            return false;
+        }
+
         if let Some(meta_data) = &self.meta_data {
             match subnet {
                 Subnet::Attestation(id) => {
@@ -102,6 +111,9 @@ impl PeerInfo {
                 }
                 Subnet::DataColumn(subnet_id) => {
                     return self.is_assigned_to_custody_subnet(subnet_id);
+                }
+                Subnet::ExecutionProof => {
+                    unreachable!("zkvm flag is only in the ENR")
                 }
             }
         }
@@ -268,6 +280,11 @@ impl PeerInfo {
             .any(|subnet_id| self.subnets.contains(&Subnet::DataColumn(*subnet_id)));
         if subscribed_to_any_custody_subnets {
             return true;
+        }
+
+        // Check if the peer has zkVM enabled (execution proof support)
+        if let Some(enr) = self.enr.as_ref() {
+            return enr.zkvm_enabled();
         }
 
         false

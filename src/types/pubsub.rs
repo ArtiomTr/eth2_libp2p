@@ -69,6 +69,8 @@ pub enum PubsubMessage<P: Preset> {
     LightClientFinalityUpdate(Box<LightClientFinalityUpdate<P>>),
     /// Gossipsub message providing notification of a light client optimistic update.
     LightClientOptimisticUpdate(Box<LightClientOptimisticUpdate<P>>),
+    /// Gossipsub message providing notification of an [`ExecutionProof`].
+    ExecutionProof(Arc<ExecutionProof>),
 }
 
 // Implements the `DataTransform` trait of gossipsub to employ snappy compression

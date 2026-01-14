@@ -2,7 +2,7 @@
 use std::fmt::Display;
 
 use crate::types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield};
-use anyhow::Result;
+use anyhow::{anyhow, ensure, Result};
 use regex::bytes::Regex;
 use serde::Serialize;
 use ssz::{
@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use std::{ops::Deref, sync::Arc};
 use strum::IntoStaticStr;
 use try_from_iterator::TryFromIterator as _;
-use typenum::{U256, Unsigned as _};
+use typenum::{Unsigned as _, U256};
 use types::deneb::containers::BlobIdentifier;
 use types::nonstandard::Phase;
 use types::{
@@ -26,7 +26,7 @@ use types::{
         containers::{DataColumnSidecar, DataColumnsByRootIdentifier},
         primitives::ColumnIndex,
     },
-    phase0::primitives::{Epoch, ForkDigest, H256, Slot},
+    phase0::primitives::{Epoch, ForkDigest, Slot, H256},
     preset::Preset,
     traits::SignedBeaconBlock as _,
 };
@@ -793,6 +793,45 @@ impl<P: Preset> DataColumnsByRootRequest<P> {
 
     pub fn max_requested(&self) -> usize {
         self.data_column_ids.iter().map(|id| id.columns.len()).sum()
+    }
+}
+
+/// Request execution proofs by block root and proof IDs.
+#[derive(Ssz, Clone, Debug, PartialEq)]
+pub struct ExecutionProofsByRootRequest {
+    /// The block root we need proofs for
+    pub block_root: H256,
+    /// How many additional proofs we need
+    /// TODO(zkproofs): Remove. This can be inferred since `MIN_PROOFS_REQUIRED`
+    /// is a global value
+    pub count_needed: u64,
+    /// Proof IDs we already have (responder should exclude these)
+    pub already_have: Vec<ExecutionProofId>,
+}
+
+impl ExecutionProofsByRootRequest {
+    pub fn new(
+        block_root: H256,
+        already_have: Vec<ExecutionProofId>,
+        count_needed: usize,
+    ) -> Result<Self> {
+        if already_have.len() > execution_proofs::MAX_PROOFS {
+            return Err(anyhow!("Too many proof IDs in already_have"));
+        }
+
+        if count_needed == 0 {
+            return Err(anyhow!("count_needed must be > 0"));
+        }
+
+        if count_needed > execution_proofs::MAX_PROOFS {
+            return Err(anyhow!("count_needed too large"));
+        }
+
+        Ok(Self {
+            block_root,
+            count_needed: count_needed as u64,
+            already_have,
+        })
     }
 }
 

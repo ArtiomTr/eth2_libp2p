@@ -1,15 +1,15 @@
-use crate::rpc::RequestType;
 use crate::rpc::methods::*;
 use crate::rpc::protocol::{
-    ERROR_TYPE_MAX, ERROR_TYPE_MIN, Encoding, ProtocolId, RPCError, SupportedProtocol,
+    Encoding, ProtocolId, RPCError, SupportedProtocol, ERROR_TYPE_MAX, ERROR_TYPE_MIN,
 };
+use crate::rpc::RequestType;
 use crate::types::ForkContext;
 use helper_functions::misc;
 use libp2p::bytes::BufMut;
 use libp2p::bytes::BytesMut;
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
-use ssz::{ContiguousList, DynamicList, H256, SszRead as _, SszReadDefault, SszWrite as _};
+use ssz::{ContiguousList, DynamicList, SszRead as _, SszReadDefault, SszWrite as _, H256};
 use std::io::Cursor;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
@@ -93,6 +93,7 @@ impl<P: Preset> SSZSnappyInboundCodec<P> {
                 RpcSuccessResponse::BlobsByRoot(res) => res.to_ssz()?,
                 RpcSuccessResponse::DataColumnsByRoot(res) => res.to_ssz()?,
                 RpcSuccessResponse::DataColumnsByRange(res) => res.to_ssz()?,
+                RpcSuccessResponse::ExecutionProofsByRoot(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientBootstrap(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientOptimisticUpdate(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientFinalityUpdate(res) => res.to_ssz()?,
@@ -392,6 +393,7 @@ impl<P: Preset> Encoder<RequestType<P>> for SSZSnappyOutboundCodec<P> {
             RequestType::BlobsByRoot(req) => req.blob_ids.to_ssz()?,
             RequestType::DataColumnsByRange(req) => req.to_ssz()?,
             RequestType::DataColumnsByRoot(req) => req.data_column_ids.to_ssz()?,
+            RequestType::ExecutionProofsByRoot(req) => req.to_ssz()?,
             RequestType::Ping(req) => req.to_ssz()?,
             RequestType::LightClientBootstrap(req) => req.to_ssz()?,
             RequestType::LightClientUpdatesByRange(req) => req.to_ssz()?,
@@ -623,6 +625,12 @@ fn handle_rpc_request<P: Preset>(
                 )?,
             },
         ))),
+        SupportedProtocol::ExecutionProofsByRootV1 => {
+            let request = ExecutionProofsByRootRequest::from_ssz_default(decoded_buffer)
+                .map_err(RPCError::SszReadError)?;
+
+            request.validate(spec).map_err()
+        }
         SupportedProtocol::PingV1 => Ok(Some(RequestType::Ping(Ping {
             data: u64::from_ssz_default(decoded_buffer)?,
         }))),
@@ -1069,9 +1077,10 @@ fn context_bytes_to_phase(
 mod tests {
     use super::*;
     use crate::{
-        EnrSyncCommitteeBitfield, factory,
-        rpc::{Ping, methods::StatusMessage, protocol::*},
+        factory,
+        rpc::{methods::StatusMessage, protocol::*, Ping},
         types::{EnrAttestationBitfield, ForkContext},
+        EnrSyncCommitteeBitfield,
     };
     use anyhow::Result;
     use snap::write::FrameEncoder;
@@ -2064,15 +2073,13 @@ mod tests {
         wrong_fork_bytes.extend_from_slice(fork_context.context_bytes(GENESIS_EPOCH).as_bytes());
         wrong_fork_bytes.extend_from_slice(&encoded_bytes.split_off(4));
 
-        assert!(
-            decode_response::<Mainnet>(
-                &config,
-                SupportedProtocol::BlocksByRangeV2,
-                &mut wrong_fork_bytes,
-                Phase::Altair
-            )
-            .is_ok()
-        );
+        assert!(decode_response::<Mainnet>(
+            &config,
+            SupportedProtocol::BlocksByRangeV2,
+            &mut wrong_fork_bytes,
+            Phase::Altair
+        )
+        .is_ok());
 
         // assert!(matches!(
         //     decode_response::<Mainnet>(
@@ -2102,15 +2109,13 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(
-            decode_response::<Mainnet>(
-                &config,
-                SupportedProtocol::MetaDataV2,
-                &mut encoded_bytes,
-                Phase::Altair
-            )
-            .is_err()
-        );
+        assert!(decode_response::<Mainnet>(
+            &config,
+            SupportedProtocol::MetaDataV2,
+            &mut encoded_bytes,
+            Phase::Altair
+        )
+        .is_err());
 
         // Sending context bytes which do not correspond to any fork should return an error
         let mut encoded_bytes = encode_response::<Mainnet>(

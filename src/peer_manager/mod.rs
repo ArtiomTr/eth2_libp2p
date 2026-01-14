@@ -3,7 +3,8 @@
 use crate::common::time_cache::LRUTimeCache;
 use crate::discovery::{enr_ext::EnrExt, peer_id_to_node_id};
 use crate::rpc::{GoodbyeReason, MetaData, Protocol, RPCError, RpcErrorResponse};
-use crate::{Gossipsub, NetworkGlobals, PeerId, Subnet, SubnetDiscovery, metrics};
+use crate::service::TARGET_EXECUTION_PROOF_PEERS;
+use crate::{metrics, Gossipsub, NetworkGlobals, PeerId, Subnet, SubnetDiscovery};
 use anyhow::Result;
 use delay_map::HashSetDelay;
 use discv5::Enr;
@@ -30,7 +31,7 @@ use libp2p::multiaddr;
 pub use peerdb::peer_info::{ConnectionDirection, PeerConnectionStatus, PeerInfo};
 use peerdb::score::{PeerAction, ReportSource};
 pub use peerdb::sync_status::{SyncInfo, SyncStatus};
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::net::IpAddr;
 use strum::IntoEnumIterator;
 
@@ -110,6 +111,8 @@ pub struct PeerManager {
     /// discovery queries for subnet peers if we disconnect from existing sync
     /// committee subnet peers.
     sync_committee_subnets: HashMap<SubnetId, Instant>,
+    /// Keeps track of whether this node has zkVM execution proof support enabled
+    execution_proof_enabled: bool,
     /// A mapping of all custody groups to column subnets to avoid re-computation.
     subnets_by_custody_group: HashMap<CustodyIndex, Vec<SubnetId>>,
     /// The heartbeat interval to perform routine maintenance.
@@ -159,6 +162,7 @@ impl PeerManager {
         let config::Config {
             discovery_enabled,
             metrics_enabled,
+            execution_proof_enabled,
             target_peer_count,
             status_interval,
             ping_interval_inbound,
@@ -197,6 +201,7 @@ impl PeerManager {
             target_peers: target_peer_count,
             temporary_banned_peers: LRUTimeCache::new(PEER_RECONNECTION_TIMEOUT),
             sync_committee_subnets: Default::default(),
+            execution_proof_enabled,
             subnets_by_custody_group,
             heartbeat,
             discovery_enabled,
@@ -600,6 +605,7 @@ impl PeerManager {
                     Protocol::BlobsByRoot => PeerAction::MidToleranceError,
                     Protocol::DataColumnsByRoot => PeerAction::MidToleranceError,
                     Protocol::DataColumnsByRange => PeerAction::MidToleranceError,
+                    Protocol::ExecutionProofsByRoot => PeerAction::MidToleranceError,
                     Protocol::Goodbye => PeerAction::LowToleranceError,
                     Protocol::MetaData => PeerAction::LowToleranceError,
                     Protocol::Status => PeerAction::LowToleranceError,
@@ -621,6 +627,7 @@ impl PeerManager {
                     Protocol::BlobsByRoot => return,
                     Protocol::DataColumnsByRoot => return,
                     Protocol::DataColumnsByRange => return,
+                    Protocol::ExecutionProofsByRoot => return,
                     Protocol::Goodbye => return,
                     Protocol::LightClientBootstrap => return,
                     Protocol::LightClientOptimisticUpdate => return,
@@ -644,6 +651,7 @@ impl PeerManager {
                     Protocol::BlobsByRoot => PeerAction::MidToleranceError,
                     Protocol::DataColumnsByRoot => PeerAction::MidToleranceError,
                     Protocol::DataColumnsByRange => PeerAction::MidToleranceError,
+                    Protocol::ExecutionProofsByRoot => PeerAction::MidToleranceError,
                     Protocol::LightClientBootstrap => return,
                     Protocol::LightClientOptimisticUpdate => return,
                     Protocol::LightClientFinalityUpdate => return,
@@ -1004,6 +1012,46 @@ impl PeerManager {
         }
     }
 
+    /// Run discovery query for zkVM-enabled peers if we fall below `TARGET_EXECUTION_PROOF_PEERS`.
+    fn maintain_execution_proof_peers(&mut self) {
+        // Only maintain peers if zkVM is enabled
+        if !self.execution_proof_enabled {
+            return;
+        }
+
+        // Check if we have enough zkVM-enabled peers
+        // Count peers subscribed to the execution_proof gossip topic
+        // TODO(zkproofs): Note that since peers do not advertise whether
+        // they are proof generating, we cannot favour them. This is
+        // fine for optional proofs and mandatory proofs will imply
+        // that the builder who is well connected will propagate it
+        // to most of the network.
+        let zkvm_peer_count = self
+            .network_globals
+            .peers
+            .read()
+            .connected_peers()
+            .filter(|(_, info)| {
+                // Check if peer is subscribed to ExecutionProof gossip topic
+                info.on_subnet_gossipsub(&Subnet::ExecutionProof)
+            })
+            .count();
+
+        if zkvm_peer_count < TARGET_EXECUTION_PROOF_PEERS {
+            debug!(
+                current_peers = zkvm_peer_count,
+                target = TARGET_EXECUTION_PROOF_PEERS,
+                "Making discovery query for zkVM-enabled peers"
+            );
+            self.events.push(PeerManagerEvent::DiscoverSubnetPeers(vec![
+                SubnetDiscovery {
+                    subnet: Subnet::ExecutionProof,
+                    min_ttl: None,
+                },
+            ]));
+        }
+    }
+
     fn maintain_trusted_peers(&mut self) {
         let trusted_peers = self.trusted_peers.clone();
         for trusted_peer in trusted_peers {
@@ -1080,6 +1128,10 @@ impl PeerManager {
                     }
                     Subnet::DataColumn(id) => {
                         peer_info.custody_subnets.insert(id);
+                    }
+                    Subnet::ExecutionProof => {
+                        // ExecutionProof uses a single topic, not subnet-based
+                        // So there is no subnet assignment to track
                     }
                 }
             }
@@ -1449,6 +1501,9 @@ impl PeerManager {
         // Maintain minimum count for sync committee peers.
         self.maintain_sync_committee_peers();
 
+        // Maintain minimum count for zkVM-enabled peers (if zkVM is enabled).
+        self.maintain_execution_proof_peers();
+
         // Prune any excess peers back to our target in such a way that incentivises good scores and
         // a uniform distribution of subnets.
         self.prune_excess_peers();
@@ -1702,8 +1757,8 @@ enum ConnectingType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NetworkConfig;
     use crate::rpc::MetaDataV3;
+    use crate::NetworkConfig;
     use types::{
         config::Config as ChainConfig, nonstandard::Phase, phase0::primitives::ForkDigest,
         preset::Mainnet,
@@ -1819,40 +1874,32 @@ mod tests {
         // Check that one outbound-only peer was removed because it had the worst score
         // and that we did not disconnect the other outbound peer due to the minimum outbound quota.
         assert_eq!(peer_manager.network_globals.connected_or_dialing_peers(), 3);
-        assert!(
-            peer_manager
-                .network_globals
-                .peers
-                .read()
-                .is_connected(&outbound_only_peer1)
-        );
-        assert!(
-            !peer_manager
-                .network_globals
-                .peers
-                .read()
-                .is_connected(&outbound_only_peer2)
-        );
+        assert!(peer_manager
+            .network_globals
+            .peers
+            .read()
+            .is_connected(&outbound_only_peer1));
+        assert!(!peer_manager
+            .network_globals
+            .peers
+            .read()
+            .is_connected(&outbound_only_peer2));
 
         // The trusted peer remains connected
-        assert!(
-            peer_manager
-                .network_globals
-                .peers
-                .read()
-                .is_connected(&trusted_peer)
-        );
+        assert!(peer_manager
+            .network_globals
+            .peers
+            .read()
+            .is_connected(&trusted_peer));
 
         peer_manager.heartbeat();
 
         // The trusted peer remains connected, even after subsequent heartbeats.
-        assert!(
-            peer_manager
-                .network_globals
-                .peers
-                .read()
-                .is_connected(&trusted_peer)
-        );
+        assert!(peer_manager
+            .network_globals
+            .peers
+            .read()
+            .is_connected(&trusted_peer));
 
         // Check that if we are at target number of peers, we do not disconnect any.
         assert_eq!(peer_manager.network_globals.connected_or_dialing_peers(), 3);
@@ -2170,7 +2217,13 @@ mod tests {
             // id mod % 4
             // except for the last 5 peers which all go on their own subnets
             // So subnets 0-2 should have 4 peers subnet 3 should have 3 and 15-19 should have 1
-            let subnet: u64 = { if x < 15 { x % 4 } else { x } };
+            let subnet: u64 = {
+                if x < 15 {
+                    x % 4
+                } else {
+                    x
+                }
+            };
 
             let peer = PeerId::random();
             peer_manager.inject_connect_ingoing(&peer, "/ip4/0.0.0.0".parse().unwrap(), None);

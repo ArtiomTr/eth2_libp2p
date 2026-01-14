@@ -8,31 +8,31 @@ pub(crate) mod enr;
 pub mod enr_ext;
 
 // Allow external use of the ENR builder
-use crate::{ClearDialError, metrics};
+use crate::{metrics, ClearDialError};
 use crate::{Enr, NetworkConfig, NetworkGlobals, Subnet, SubnetDiscovery};
-use discv5::{Discv5, enr::NodeId};
-pub use enr::{CombinedKey, Eth2Enr, build_enr, load_enr_from_disk, use_or_load_enr};
-pub use enr_ext::{CombinedKeyExt, EnrExt, peer_id_to_node_id};
+use discv5::{enr::NodeId, Discv5};
+pub use enr::{build_enr, load_enr_from_disk, use_or_load_enr, CombinedKey, Eth2Enr};
+pub use enr_ext::{peer_id_to_node_id, CombinedKeyExt, EnrExt};
 pub use libp2p::identity::{Keypair, PublicKey};
 
 use alloy_rlp::bytes::Bytes;
-use anyhow::{Error, Result, anyhow};
+use anyhow::{anyhow, Error, Result};
 use enr::{
     ATTESTATION_BITFIELD_ENR_KEY, ETH2_ENR_KEY, NEXT_FORK_DIGEST_ENR_KEY,
-    PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY, SYNC_COMMITTEE_BITFIELD_ENR_KEY,
+    PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY, SYNC_COMMITTEE_BITFIELD_ENR_KEY, ZKVM_ENABLED_ENR_KEY,
 };
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use libp2p::core::transport::PortUse;
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::THandlerInEvent;
 use libp2p::swarm::behaviour::{DialFailure, FromSwarm};
+use libp2p::swarm::THandlerInEvent;
 pub use libp2p::{
-    core::{ConnectedPoint, Multiaddr, transport::ListenerId},
+    core::{transport::ListenerId, ConnectedPoint, Multiaddr},
     identity::PeerId,
     swarm::{
-        ConnectionId, DialError, NetworkBehaviour, NotifyHandler, SubstreamProtocol, ToSwarm,
-        dummy::ConnectionHandler,
+        dummy::ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler,
+        SubstreamProtocol, ToSwarm,
     },
 };
 use logging::exception;
@@ -552,6 +552,12 @@ impl<P: Preset> Discovery<P> {
             }
             // Data column subnets are computed from node ID. No subnet bitfield in the ENR.
             Subnet::DataColumn(_) => return Ok(()),
+            // Execution proof uses a simple boolean flag in the ENR
+            Subnet::ExecutionProof => {
+                self.discv5
+                    .enr_insert(ZKVM_ENABLED_ENR_KEY, &value)
+                    .map_err(|e| anyhow!("{:?}", e))?;
+            }
         }
 
         // replace the global version
@@ -903,6 +909,7 @@ impl<P: Preset> Discovery<P> {
                                 Subnet::Attestation(_) => "attestation",
                                 Subnet::SyncCommittee(_) => "sync_committee",
                                 Subnet::DataColumn(_) => "data_column",
+                                Subnet::ExecutionProof => "execution_proof",
                             };
 
                             if let Some(v) = crate::common::metrics::get_int_counter(
