@@ -1,15 +1,16 @@
+use crate::rpc::RequestType;
 use crate::rpc::methods::*;
 use crate::rpc::protocol::{
-    Encoding, ProtocolId, RPCError, SupportedProtocol, ERROR_TYPE_MAX, ERROR_TYPE_MIN,
+    ERROR_TYPE_MAX, ERROR_TYPE_MIN, Encoding, ProtocolId, RPCError, SupportedProtocol,
 };
-use crate::rpc::RequestType;
 use crate::types::ForkContext;
+use execution_proofs::ExecutionProof;
 use helper_functions::misc;
 use libp2p::bytes::BufMut;
 use libp2p::bytes::BytesMut;
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
-use ssz::{ContiguousList, DynamicList, SszRead as _, SszReadDefault, SszWrite as _, H256};
+use ssz::{ContiguousList, DynamicList, H256, SszRead as _, SszReadDefault, SszWrite as _};
 use std::io::Cursor;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
@@ -94,6 +95,7 @@ impl<P: Preset> SSZSnappyInboundCodec<P> {
                 RpcSuccessResponse::DataColumnsByRoot(res) => res.to_ssz()?,
                 RpcSuccessResponse::DataColumnsByRange(res) => res.to_ssz()?,
                 RpcSuccessResponse::ExecutionProofsByRoot(res) => res.to_ssz()?,
+                RpcSuccessResponse::ExecutionProofsByRange(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientBootstrap(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientOptimisticUpdate(res) => res.to_ssz()?,
                 RpcSuccessResponse::LightClientFinalityUpdate(res) => res.to_ssz()?,
@@ -394,6 +396,7 @@ impl<P: Preset> Encoder<RequestType<P>> for SSZSnappyOutboundCodec<P> {
             RequestType::DataColumnsByRange(req) => req.to_ssz()?,
             RequestType::DataColumnsByRoot(req) => req.data_column_ids.to_ssz()?,
             RequestType::ExecutionProofsByRoot(req) => req.to_ssz()?,
+            RequestType::ExecutionProofsByRange(req) => req.to_ssz()?,
             RequestType::Ping(req) => req.to_ssz()?,
             RequestType::LightClientBootstrap(req) => req.to_ssz()?,
             RequestType::LightClientUpdatesByRange(req) => req.to_ssz()?,
@@ -629,7 +632,14 @@ fn handle_rpc_request<P: Preset>(
             let request = ExecutionProofsByRootRequest::from_ssz_default(decoded_buffer)
                 .map_err(RPCError::SszReadError)?;
 
-            request.validate(spec).map_err()
+            request.validate(config).map_err(RPCError::InvalidData)?;
+
+            Ok(Some(RequestType::ExecutionProofsByRoot(request)))
+        }
+        SupportedProtocol::ExecutionProofsByRangeV1 => {
+            Ok(Some(RequestType::ExecutionProofsByRange(
+                ExecutionProofsByRangeRequest::from_ssz_default(decoded_buffer)?,
+            )))
         }
         SupportedProtocol::PingV1 => Ok(Some(RequestType::Ping(Ping {
             data: u64::from_ssz_default(decoded_buffer)?,
@@ -796,6 +806,16 @@ fn handle_rpc_response<P: Preset>(
                 ),
             )),
         },
+        SupportedProtocol::ExecutionProofsByRootV1 => {
+            Ok(Some(RpcSuccessResponse::ExecutionProofsByRoot(Arc::new(
+                ExecutionProof::from_ssz_default(decoded_buffer)?,
+            ))))
+        }
+        SupportedProtocol::ExecutionProofsByRangeV1 => {
+            Ok(Some(RpcSuccessResponse::ExecutionProofsByRange(Arc::new(
+                ExecutionProof::from_ssz_default(decoded_buffer)?,
+            ))))
+        }
         SupportedProtocol::PingV1 => Ok(Some(RpcSuccessResponse::Pong(Ping {
             data: u64::from_ssz_default(decoded_buffer)?,
         }))),
@@ -1077,12 +1097,12 @@ fn context_bytes_to_phase(
 mod tests {
     use super::*;
     use crate::{
-        factory,
-        rpc::{methods::StatusMessage, protocol::*, Ping},
+        EnrSyncCommitteeBitfield, factory,
+        rpc::{Ping, methods::StatusMessage, protocol::*},
         types::{EnrAttestationBitfield, ForkContext},
-        EnrSyncCommitteeBitfield,
     };
     use anyhow::Result;
+    use execution_proofs::ExecutionProofId;
     use snap::write::FrameEncoder;
     use ssz::{ByteList, DynamicList};
     use std::io::Write;
@@ -1270,6 +1290,11 @@ mod tests {
         }
     }
 
+    fn execution_proofs_by_root_request() -> ExecutionProofsByRootRequest {
+        ExecutionProofsByRootRequest::new(H256::zero(), vec![ExecutionProofId::new(0).unwrap()], 2)
+            .unwrap()
+    }
+
     fn ping_message() -> Ping {
         Ping { data: 1 }
     }
@@ -1442,6 +1467,15 @@ mod tests {
             }
             RequestType::DataColumnsByRange(dcbrange) => {
                 assert_eq!(decoded, RequestType::DataColumnsByRange(dcbrange))
+            }
+            RequestType::ExecutionProofsByRoot(exec_proofs) => {
+                assert_eq!(decoded, RequestType::ExecutionProofsByRoot(exec_proofs))
+            }
+            RequestType::ExecutionProofsByRange(exec_proofs_range) => {
+                assert_eq!(
+                    decoded,
+                    RequestType::ExecutionProofsByRange(exec_proofs_range)
+                )
             }
             RequestType::Ping(ping) => {
                 assert_eq!(decoded, RequestType::Ping(ping))
@@ -2073,13 +2107,15 @@ mod tests {
         wrong_fork_bytes.extend_from_slice(fork_context.context_bytes(GENESIS_EPOCH).as_bytes());
         wrong_fork_bytes.extend_from_slice(&encoded_bytes.split_off(4));
 
-        assert!(decode_response::<Mainnet>(
-            &config,
-            SupportedProtocol::BlocksByRangeV2,
-            &mut wrong_fork_bytes,
-            Phase::Altair
-        )
-        .is_ok());
+        assert!(
+            decode_response::<Mainnet>(
+                &config,
+                SupportedProtocol::BlocksByRangeV2,
+                &mut wrong_fork_bytes,
+                Phase::Altair
+            )
+            .is_ok()
+        );
 
         // assert!(matches!(
         //     decode_response::<Mainnet>(
@@ -2109,13 +2145,15 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(decode_response::<Mainnet>(
-            &config,
-            SupportedProtocol::MetaDataV2,
-            &mut encoded_bytes,
-            Phase::Altair
-        )
-        .is_err());
+        assert!(
+            decode_response::<Mainnet>(
+                &config,
+                SupportedProtocol::MetaDataV2,
+                &mut encoded_bytes,
+                Phase::Altair
+            )
+            .is_err()
+        );
 
         // Sending context bytes which do not correspond to any fork should return an error
         let mut encoded_bytes = encode_response::<Mainnet>(
@@ -2181,6 +2219,7 @@ mod tests {
             RequestType::DataColumnsByRoot(dcbroot_request::<Mainnet>(&config)),
             RequestType::MetaData(MetadataRequest::new_v2()),
             RequestType::MetaData(MetadataRequest::new_v3()),
+            RequestType::ExecutionProofsByRoot(execution_proofs_by_root_request()),
         ];
         for req in requests.iter() {
             for fork_name in enum_iterator::all::<Phase>() {

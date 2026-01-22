@@ -1,6 +1,7 @@
 use super::methods::*;
 use crate::rpc::codec::SSZSnappyInboundCodec;
 use crate::types::ForkContext;
+use execution_proofs::ExecutionProof;
 use futures::future::BoxFuture;
 use futures::prelude::{AsyncRead, AsyncWrite};
 use futures::{FutureExt, StreamExt};
@@ -157,6 +158,10 @@ fn rpc_light_client_bootstrap_limits_by_fork<P: Preset>(current_fork: Phase) -> 
     }
 }
 
+fn rpc_execution_proof_limits() -> RpcLimits {
+    RpcLimits::new(ExecutionProof::min_size(), ExecutionProof::max_size())
+}
+
 /// Protocol names to be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, AsRefStr, Display)]
 #[strum(serialize_all = "snake_case")]
@@ -183,6 +188,12 @@ pub enum Protocol {
     /// The `DataColumnSidecarsByRange` protocol name.
     #[strum(serialize = "data_column_sidecars_by_range")]
     DataColumnsByRange,
+    /// The `ExecutionProofsByRoot` protocol name.
+    #[strum(serialize = "execution_proofs_by_root")]
+    ExecutionProofsByRoot,
+    /// The `ExecutionProofsByRange` protocol name.
+    #[strum(serialize = "execution_proofs_by_range")]
+    ExecutionProofsByRange,
     /// The `Ping` protocol name.
     Ping,
     /// The `MetaData` protocol name.
@@ -213,6 +224,8 @@ impl Protocol {
             Protocol::BlobsByRoot => Some(ResponseTermination::BlobsByRoot),
             Protocol::DataColumnsByRoot => Some(ResponseTermination::DataColumnsByRoot),
             Protocol::DataColumnsByRange => Some(ResponseTermination::DataColumnsByRange),
+            Protocol::ExecutionProofsByRoot => Some(ResponseTermination::ExecutionProofsByRoot),
+            Protocol::ExecutionProofsByRange => Some(ResponseTermination::ExecutionProofsByRange),
             Protocol::Ping => None,
             Protocol::MetaData => None,
             Protocol::LightClientBootstrap => None,
@@ -245,6 +258,8 @@ pub enum SupportedProtocol {
     BlobsByRootV1,
     DataColumnsByRootV1,
     DataColumnsByRangeV1,
+    ExecutionProofsByRootV1,
+    ExecutionProofsByRangeV1,
     PingV1,
     MetaDataV1,
     MetaDataV2,
@@ -269,6 +284,8 @@ impl SupportedProtocol {
             SupportedProtocol::BlobsByRootV1 => "1",
             SupportedProtocol::DataColumnsByRootV1 => "1",
             SupportedProtocol::DataColumnsByRangeV1 => "1",
+            SupportedProtocol::ExecutionProofsByRootV1 => "1",
+            SupportedProtocol::ExecutionProofsByRangeV1 => "1",
             SupportedProtocol::PingV1 => "1",
             SupportedProtocol::MetaDataV1 => "1",
             SupportedProtocol::MetaDataV2 => "2",
@@ -293,6 +310,8 @@ impl SupportedProtocol {
             SupportedProtocol::BlobsByRootV1 => Protocol::BlobsByRoot,
             SupportedProtocol::DataColumnsByRootV1 => Protocol::DataColumnsByRoot,
             SupportedProtocol::DataColumnsByRangeV1 => Protocol::DataColumnsByRange,
+            SupportedProtocol::ExecutionProofsByRootV1 => Protocol::ExecutionProofsByRoot,
+            SupportedProtocol::ExecutionProofsByRangeV1 => Protocol::ExecutionProofsByRange,
             SupportedProtocol::PingV1 => Protocol::Ping,
             SupportedProtocol::MetaDataV1 => Protocol::MetaData,
             SupportedProtocol::MetaDataV2 => Protocol::MetaData,
@@ -341,6 +360,18 @@ impl SupportedProtocol {
             supported.extend_from_slice(&[
                 ProtocolId::new(SupportedProtocol::DataColumnsByRootV1, Encoding::SSZSnappy),
                 ProtocolId::new(SupportedProtocol::DataColumnsByRangeV1, Encoding::SSZSnappy),
+            ]);
+        }
+        if fork_context.chain_config().is_zkvm_enabled() {
+            supported.extend_from_slice(&[
+                ProtocolId::new(
+                    SupportedProtocol::ExecutionProofsByRootV1,
+                    Encoding::SSZSnappy,
+                ),
+                ProtocolId::new(
+                    SupportedProtocol::ExecutionProofsByRangeV1,
+                    Encoding::SSZSnappy,
+                ),
             ]);
         }
         supported
@@ -467,6 +498,13 @@ impl ProtocolId {
                 DataColumnsByRangeRequest::<P>::ssz_max_len()
                     .expect("Unable to get DataColumnsByRange ssz_max_len"),
             ),
+            Protocol::ExecutionProofsByRoot => {
+                RpcLimits::new(0, chain_config.max_request_blocks(phase) as usize)
+            }
+            Protocol::ExecutionProofsByRange => RpcLimits::new(
+                ExecutionProofsByRangeRequest::SIZE.get(),
+                ExecutionProofsByRangeRequest::SIZE.get(),
+            ),
             Protocol::Ping => RpcLimits::new(Ping::SIZE.get(), Ping::SIZE.get()),
             Protocol::LightClientBootstrap => RpcLimits::new(
                 LightClientBootstrapRequest::SIZE.get(),
@@ -496,6 +534,8 @@ impl ProtocolId {
             Protocol::DataColumnsByRange => {
                 rpc_data_column_limits::<P>(fork_context.current_fork_name())
             }
+            Protocol::ExecutionProofsByRoot => rpc_execution_proof_limits(),
+            Protocol::ExecutionProofsByRange => rpc_execution_proof_limits(),
             Protocol::Ping => RpcLimits::new(Ping::SIZE.get(), Ping::SIZE.get()),
             Protocol::MetaData => RpcLimits::new(MetaDataV1::SIZE.get(), MetaDataV3::SIZE.get()),
             Protocol::LightClientBootstrap => {
@@ -537,6 +577,8 @@ impl ProtocolId {
             | SupportedProtocol::StatusV2
             | SupportedProtocol::BlocksByRootV1
             | SupportedProtocol::BlocksByRangeV1
+            | SupportedProtocol::ExecutionProofsByRootV1
+            | SupportedProtocol::ExecutionProofsByRangeV1
             | SupportedProtocol::PingV1
             | SupportedProtocol::MetaDataV1
             | SupportedProtocol::MetaDataV2
@@ -643,6 +685,8 @@ pub enum RequestType<P: Preset> {
     BlobsByRoot(BlobsByRootRequest),
     DataColumnsByRoot(DataColumnsByRootRequest<P>),
     DataColumnsByRange(DataColumnsByRangeRequest<P>),
+    ExecutionProofsByRoot(ExecutionProofsByRootRequest),
+    ExecutionProofsByRange(ExecutionProofsByRangeRequest),
     LightClientBootstrap(LightClientBootstrapRequest),
     LightClientOptimisticUpdate,
     LightClientFinalityUpdate,
@@ -669,6 +713,8 @@ impl<P: Preset> RequestType<P> {
             RequestType::BlobsByRoot(req) => req.blob_ids.len() as u64,
             RequestType::DataColumnsByRoot(req) => req.max_requested() as u64,
             RequestType::DataColumnsByRange(req) => req.max_requested(),
+            RequestType::ExecutionProofsByRoot(req) => req.max_requested(),
+            RequestType::ExecutionProofsByRange(req) => req.max_proofs_requested(),
             RequestType::Ping(_) => 1,
             RequestType::MetaData(_) => 1,
             RequestType::LightClientBootstrap(_) => 1,
@@ -698,6 +744,8 @@ impl<P: Preset> RequestType<P> {
             RequestType::BlobsByRoot(_) => SupportedProtocol::BlobsByRootV1,
             RequestType::DataColumnsByRoot(_) => SupportedProtocol::DataColumnsByRootV1,
             RequestType::DataColumnsByRange(_) => SupportedProtocol::DataColumnsByRangeV1,
+            RequestType::ExecutionProofsByRoot(_) => SupportedProtocol::ExecutionProofsByRootV1,
+            RequestType::ExecutionProofsByRange(_) => SupportedProtocol::ExecutionProofsByRangeV1,
             RequestType::Ping(_) => SupportedProtocol::PingV1,
             RequestType::MetaData(req) => match req {
                 MetadataRequest::V1(_) => SupportedProtocol::MetaDataV1,
@@ -729,6 +777,8 @@ impl<P: Preset> RequestType<P> {
             RequestType::BlobsByRoot(_) => ResponseTermination::BlobsByRoot,
             RequestType::DataColumnsByRoot(_) => ResponseTermination::DataColumnsByRoot,
             RequestType::DataColumnsByRange(_) => ResponseTermination::DataColumnsByRange,
+            RequestType::ExecutionProofsByRoot(_) => ResponseTermination::ExecutionProofsByRoot,
+            RequestType::ExecutionProofsByRange(_) => ResponseTermination::ExecutionProofsByRange,
             RequestType::Status(_) => unreachable!(),
             RequestType::Goodbye(_) => unreachable!(),
             RequestType::Ping(_) => unreachable!(),
@@ -775,6 +825,14 @@ impl<P: Preset> RequestType<P> {
                 SupportedProtocol::DataColumnsByRangeV1,
                 Encoding::SSZSnappy,
             )],
+            RequestType::ExecutionProofsByRoot(_) => vec![ProtocolId::new(
+                SupportedProtocol::ExecutionProofsByRootV1,
+                Encoding::SSZSnappy,
+            )],
+            RequestType::ExecutionProofsByRange(_) => vec![ProtocolId::new(
+                SupportedProtocol::ExecutionProofsByRangeV1,
+                Encoding::SSZSnappy,
+            )],
             RequestType::Ping(_) => vec![ProtocolId::new(
                 SupportedProtocol::PingV1,
                 Encoding::SSZSnappy,
@@ -813,6 +871,8 @@ impl<P: Preset> RequestType<P> {
             RequestType::BlobsByRoot(_) => false,
             RequestType::DataColumnsByRoot(_) => false,
             RequestType::DataColumnsByRange(_) => false,
+            RequestType::ExecutionProofsByRoot(_) => false,
+            RequestType::ExecutionProofsByRange(_) => false,
             RequestType::Ping(_) => true,
             RequestType::MetaData(_) => true,
             RequestType::LightClientBootstrap(_) => true,
@@ -933,6 +993,12 @@ impl<P: Preset> std::fmt::Display for RequestType<P> {
             RequestType::DataColumnsByRoot(req) => write!(f, "Data columns by root: {:?}", req),
             RequestType::DataColumnsByRange(req) => {
                 write!(f, "Data columns by range: {:?}", req)
+            }
+            RequestType::ExecutionProofsByRoot(req) => {
+                write!(f, "Execution proofs by root: {:?}", req)
+            }
+            RequestType::ExecutionProofsByRange(req) => {
+                write!(f, "Execution proofs by range: {:?}", req)
             }
             RequestType::Ping(ping) => write!(f, "Ping: {}", ping.data),
             RequestType::MetaData(_) => write!(f, "MetaData request"),

@@ -3,18 +3,18 @@ use super::score::{PeerAction, Score, ScoreState};
 use super::sync_status::SyncStatus;
 use crate::discovery::Eth2Enr;
 use crate::{rpc::MetaData, types::Subnet};
-use PeerConnectionStatus::*;
 use discv5::Enr;
 use libp2p::core::multiaddr::{Multiaddr, Protocol};
 use serde::{
-    Serialize,
     ser::{SerializeStruct, Serializer},
+    Serialize,
 };
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Instant;
 use strum::AsRefStr;
 use types::phase0::primitives::SubnetId;
+use PeerConnectionStatus::*;
 
 /// Information about a given connected peer.
 #[derive(Clone, Debug, Serialize)]

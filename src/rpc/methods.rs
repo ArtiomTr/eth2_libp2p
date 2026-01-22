@@ -2,7 +2,8 @@
 use std::fmt::Display;
 
 use crate::types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
+use execution_proofs::{ExecutionProof, MAX_PROOFS};
 use regex::bytes::Regex;
 use serde::Serialize;
 use ssz::{
@@ -12,7 +13,7 @@ use std::marker::PhantomData;
 use std::{ops::Deref, sync::Arc};
 use strum::IntoStaticStr;
 use try_from_iterator::TryFromIterator as _;
-use typenum::{Unsigned as _, U256};
+use typenum::{U256, Unsigned as _};
 use types::deneb::containers::BlobIdentifier;
 use types::nonstandard::Phase;
 use types::{
@@ -26,7 +27,7 @@ use types::{
         containers::{DataColumnSidecar, DataColumnsByRootIdentifier},
         primitives::ColumnIndex,
     },
-    phase0::primitives::{Epoch, ForkDigest, Slot, H256},
+    phase0::primitives::{Epoch, ForkDigest, H256, Slot},
     preset::Preset,
     traits::SignedBeaconBlock as _,
 };
@@ -815,23 +816,63 @@ impl ExecutionProofsByRootRequest {
         already_have: Vec<ExecutionProofId>,
         count_needed: usize,
     ) -> Result<Self> {
-        if already_have.len() > execution_proofs::MAX_PROOFS {
-            return Err(anyhow!("Too many proof IDs in already_have"));
-        }
+        ensure!(
+            already_have.len() <= execution_proofs::MAX_PROOFS,
+            "Too many proof IDs in already_have"
+        );
 
-        if count_needed == 0 {
-            return Err(anyhow!("count_needed must be > 0"));
-        }
+        ensure!(count_needed > 0, "count_needed must be > 0");
 
-        if count_needed > execution_proofs::MAX_PROOFS {
-            return Err(anyhow!("count_needed too large"));
-        }
+        ensure!(
+            count_needed <= execution_proofs::MAX_PROOFS,
+            "count_needed too large: {} > {}",
+            count_needed,
+            execution_proofs::MAX_PROOFS
+        );
 
         Ok(Self {
             block_root,
             count_needed: count_needed as u64,
             already_have,
         })
+    }
+
+    pub fn validate(&self, _config: &ChainConfig) -> Result<()> {
+        ensure!(
+            self.already_have.len() <= execution_proofs::MAX_PROOFS,
+            "Too many proof IDs in already_have"
+        );
+
+        ensure!(self.count_needed > 0, "count_needed must be > 0");
+
+        ensure!(
+            self.count_needed as usize <= execution_proofs::MAX_PROOFS,
+            "count_needed too large: {} > {}",
+            self.count_needed,
+            execution_proofs::MAX_PROOFS
+        );
+
+        Ok(())
+    }
+
+    pub fn max_requested(&self) -> u64 {
+        self.count_needed
+    }
+}
+
+/// Request execution proofs for a range of slots.
+#[derive(Ssz, Clone, Debug, PartialEq)]
+pub struct ExecutionProofsByRangeRequest {
+    /// The starting slot to request execution proofs.
+    pub start_slot: u64,
+    /// The number of slots from the start slot.
+    pub count: u64,
+}
+
+impl ExecutionProofsByRangeRequest {
+    pub fn max_proofs_requested(&self) -> u64 {
+        self.count
+            .saturating_mul(execution_proofs::MAX_PROOFS as u64)
     }
 }
 
@@ -889,6 +930,12 @@ pub enum RpcSuccessResponse<P: Preset> {
     /// A response to a get DATA_COLUMN_SIDECARS_BY_RANGE request.
     DataColumnsByRange(Arc<DataColumnSidecar<P>>),
 
+    /// A response to a get EXECUTION_PROOFS_BY_ROOT request.
+    ExecutionProofsByRoot(Arc<ExecutionProof>),
+
+    /// A response to a get EXECUTION_PROOFS_BY_RANGE request.
+    ExecutionProofsByRange(Arc<ExecutionProof>),
+
     /// A PONG response to a PING request.
     Pong(Ping),
 
@@ -917,6 +964,12 @@ pub enum ResponseTermination {
     /// Data column sidecars by range stream termination.
     DataColumnsByRange,
 
+    /// Execution proofs by root stream termination.
+    ExecutionProofsByRoot,
+
+    /// Execution proofs by range stream termination.
+    ExecutionProofsByRange,
+
     /// Light client updates by range stream termination.
     LightClientUpdatesByRange,
 }
@@ -930,6 +983,8 @@ impl ResponseTermination {
             ResponseTermination::BlobsByRoot => Protocol::BlobsByRoot,
             ResponseTermination::DataColumnsByRoot => Protocol::DataColumnsByRoot,
             ResponseTermination::DataColumnsByRange => Protocol::DataColumnsByRange,
+            ResponseTermination::ExecutionProofsByRoot => Protocol::ExecutionProofsByRoot,
+            ResponseTermination::ExecutionProofsByRange => Protocol::ExecutionProofsByRange,
             ResponseTermination::LightClientUpdatesByRange => Protocol::LightClientUpdatesByRange,
         }
     }
@@ -1025,6 +1080,8 @@ impl<P: Preset> RpcSuccessResponse<P> {
             RpcSuccessResponse::BlobsByRoot(_) => Protocol::BlobsByRoot,
             RpcSuccessResponse::DataColumnsByRoot(_) => Protocol::DataColumnsByRoot,
             RpcSuccessResponse::DataColumnsByRange(_) => Protocol::DataColumnsByRange,
+            RpcSuccessResponse::ExecutionProofsByRoot(_) => Protocol::ExecutionProofsByRoot,
+            RpcSuccessResponse::ExecutionProofsByRange(_) => Protocol::ExecutionProofsByRange,
             RpcSuccessResponse::Pong(_) => Protocol::Ping,
             RpcSuccessResponse::MetaData(_) => Protocol::MetaData,
             RpcSuccessResponse::LightClientBootstrap(_) => Protocol::LightClientBootstrap,
@@ -1054,7 +1111,9 @@ impl<P: Preset> RpcSuccessResponse<P> {
             }
             RpcSuccessResponse::LightClientFinalityUpdate(update) => Some(update.signature_slot()),
             RpcSuccessResponse::LightClientUpdatesByRange(update) => Some(update.signature_slot()),
-            RpcSuccessResponse::MetaData(_)
+            RpcSuccessResponse::ExecutionProofsByRoot(_)
+            | RpcSuccessResponse::ExecutionProofsByRange(_)
+            | RpcSuccessResponse::MetaData(_)
             | RpcSuccessResponse::Status(_)
             | RpcSuccessResponse::Pong(_) => None,
         }
@@ -1114,6 +1173,16 @@ impl<P: Preset> std::fmt::Display for RpcSuccessResponse<P> {
                     f,
                     "DataColumnsByRange: Data column slot: {}",
                     sidecar.slot()
+                )
+            }
+            RpcSuccessResponse::ExecutionProofsByRoot(proof) => {
+                write!(f, "ExecutionProofsByRoot: Block root: {}", proof.block_root)
+            }
+            RpcSuccessResponse::ExecutionProofsByRange(proof) => {
+                write!(
+                    f,
+                    "ExecutionProofsByRange: Block root: {}",
+                    proof.block_root
                 )
             }
             RpcSuccessResponse::Pong(ping) => write!(f, "Pong: {}", ping.data),
@@ -1235,6 +1304,28 @@ impl<P: Preset> std::fmt::Display for DataColumnsByRangeRequest<P> {
             self.start_slot,
             self.count,
             self.columns.len()
+        )
+    }
+}
+
+impl std::fmt::Display for ExecutionProofsByRootRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request: ExecutionProofsByRoot: Block Root: {}, Already Have: {}, Count Needed: {}",
+            self.block_root,
+            self.already_have.len(),
+            self.count_needed
+        )
+    }
+}
+
+impl std::fmt::Display for ExecutionProofsByRangeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request: ExecutionProofsByRange: Start Slot: {}, Count: {}",
+            self.start_slot, self.count
         )
     }
 }
